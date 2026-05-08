@@ -1,8 +1,10 @@
-# SemiclipML (AI Slop Edition)
+# SemiclipML (Slop Edition)
 
-**Warning:** This is an experimental version. Not recommended for production use on public servers without thorough testing.
+**Warning:** This is an experimental version. Not recommended for production use on public servers. The build targets Windows. 
 
-*Note: This project was developed with AI assistance. Collision logic and edict handling were fine-tuned for Sven Co-op server stability and engine-level compatibility.*
+You can still execute the stuck command (L) and walk through obstacles. Fixing that wasn't part of the original task.
+
+*Note: This project was developed with AI assistance. Collision logic and edict handling were fine-tuned for Sven Co-op. Below are some bold claims that aren't particularly helpful :D*
 
 SemiclipML is a Metamod plugin for Sven Co-op that provides advanced player-to-player collision management. It allows players to pass through each other in tight spaces while maintaining tactical solid collision for boosting and landing.
 
