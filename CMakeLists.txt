@@ -32,17 +32,27 @@ endif()
 message(STATUS "Using HLSDK:   ${MMP_SDK}")
 message(STATUS "Using metamod: ${MMP_META}")
 
-include_directories(${MMP_SDK}/common)
-include_directories(${MMP_SDK}/dlls)
-include_directories(${MMP_SDK}/engine)
-include_directories(${MMP_SDK}/pm_shared)
-include_directories(${MMP_META})
+# SYSTEM: suppress warnings coming from third-party headers (metamod-p's
+# DLLINTERNAL visibility attribute trips -Wattributes on modern gcc) while
+# keeping full warnings for our own sources.
+include_directories(SYSTEM ${MMP_SDK}/common)
+include_directories(SYSTEM ${MMP_SDK}/dlls)
+include_directories(SYSTEM ${MMP_SDK}/engine)
+include_directories(SYSTEM ${MMP_SDK}/pm_shared)
+include_directories(SYSTEM ${MMP_META})
 
 # Determine OS
 if(WIN32)
     add_definitions(-DWIN32 -D_WINDOWS -D_CRT_SECURE_NO_WARNINGS)
 else()
     add_definitions(-Dlinux)
+    # GoldSrc is 32-bit; -m32 must apply to compile AND link.
+    # -mincoming-stack-boundary=2: the engine/metamod call in with 4-byte
+    # stack alignment, modern gcc assumes 16 - without this you get random
+    # runtime crashes, not build errors (same fix metamod-p applies to its
+    # own example plugins).
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m32 -march=i686 -mincoming-stack-boundary=2 -fno-strict-aliasing")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -m32")
 endif()
 
 # Project Sources (Only our code)
@@ -57,4 +67,7 @@ add_library(SemiclipML SHARED ${PROJECT_SRCS})
 # No extra libs needed for pure metamod plugin usually, maybe standard system ones implicitly
 if(WIN32)
     target_link_libraries(SemiclipML user32)
+else()
+    # SemiclipML.so instead of libSemiclipML.so - matches plugins.ini habits.
+    set_target_properties(SemiclipML PROPERTIES PREFIX "")
 endif()

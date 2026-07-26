@@ -1,6 +1,14 @@
 #include "Config.h"
 #include <cstdio>
 
+#if defined(__GNUC__)
+// Old HLSDK structs (plugin_info_t, cvar_t) and engine prototypes take
+// non-const char*; the string literals we pass are never written to.
+// Compiler-level guard on purpose: gcc AND clang warn (-Wwrite-strings),
+// MSVC does not - this is about the compiler, not the OS.
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+#endif
+
 // Flags: FCVAR_EXTDLL is required for the engine to expose these as console commands from a DLL
 #define SMC_CVAR_FLAGS (FCVAR_EXTDLL | FCVAR_SERVER)
 

@@ -5,6 +5,14 @@
 #include <meta_api.h>
 #include <cstring>
 
+#if defined(__GNUC__)
+// Old HLSDK structs (plugin_info_t, cvar_t) and engine prototypes take
+// non-const char*; the string literals we pass are never written to.
+// Compiler-level guard on purpose: gcc AND clang warn (-Wwrite-strings),
+// MSVC does not - this is about the compiler, not the OS.
+#pragma GCC diagnostic ignored "-Wwrite-strings"
+#endif
+
 // Global vars
 meta_globals_t *gpMetaGlobals;
 gamedll_funcs_t *gpGamedllFuncs;
@@ -22,7 +30,7 @@ plugin_info_t Plugin_info = {
     "SemiclipML",           // name
     "2.5",                  // version
     "2026/07/26",           // date
-    "mentol",                 // author
+    "Necr",                 // author
     "",                     // url
     "SMC",                  // logtag
     PT_CHANGELEVEL,         // (when) loadable

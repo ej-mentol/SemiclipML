@@ -1,0 +1,4 @@
+# Shell scripts must stay LF or bash on Linux chokes on \r
+*.sh text eol=lf
+# Batch files are happier as CRLF on Windows
+*.bat text eol=crlf
