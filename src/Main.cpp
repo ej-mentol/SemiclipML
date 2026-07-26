@@ -29,15 +29,11 @@ plugin_info_t Plugin_info = {
     PT_CHANGELEVEL,         // (when) unloadable
 };
 
-static enginefuncs_t g_engine_hooks;
-static enginefuncs_t g_engine_hooks_post;
 DLL_FUNCTIONS g_dll_hooks;
 static DLL_FUNCTIONS g_dll_hooks_post;
 
 // Initialization
 void PluginInit() {
-  std::memset(&g_engine_hooks, 0, sizeof(g_engine_hooks));
-  std::memset(&g_engine_hooks_post, 0, sizeof(g_engine_hooks_post));
   std::memset(&g_dll_hooks, 0, sizeof(g_dll_hooks));
   std::memset(&g_dll_hooks_post, 0, sizeof(g_dll_hooks_post));
 
@@ -83,37 +79,6 @@ C_DLLEXPORT int GetEntityAPI2_Post(DLL_FUNCTIONS *pFunctionTable,
   return TRUE;
 }
 
-C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *pengfuncsFromEngine,
-                                   int *interfaceVersion) {
-  if (!pengfuncsFromEngine || !interfaceVersion) {
-    return FALSE;
-  }
-
-  if (*interfaceVersion != ENGINE_INTERFACE_VERSION) {
-    *interfaceVersion = ENGINE_INTERFACE_VERSION;
-    return FALSE;
-  }
-
-  std::memcpy(pengfuncsFromEngine, &g_engine_hooks, sizeof(enginefuncs_t));
-  return TRUE;
-}
-
-C_DLLEXPORT int GetEngineFunctions_Post(enginefuncs_t *pengfuncsFromEngine,
-                                        int *interfaceVersion) {
-  if (!pengfuncsFromEngine || !interfaceVersion) {
-    return FALSE;
-  }
-
-  if (*interfaceVersion != ENGINE_INTERFACE_VERSION) {
-    *interfaceVersion = ENGINE_INTERFACE_VERSION;
-    return FALSE;
-  }
-
-  std::memcpy(pengfuncsFromEngine, &g_engine_hooks_post,
-              sizeof(enginefuncs_t));
-  return TRUE;
-}
-
 #ifdef WIN32
 extern "C" C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t *pengfuncsFromEngine,
                                        globalvars_t *pGlobals) {
@@ -134,8 +99,13 @@ static META_FUNCTIONS gMetaFunctionTable = {
     GetEntityAPI2_Post, // pfnGetEntityAPI2_Post
     NULL,               // pfnGetNewDLLFunctions
     NULL,               // pfnGetNewDLLFunctions_Post
-    GetEngineFunctions, // pfnGetEngineFunctions
-    GetEngineFunctions_Post, // pfnGetEngineFunctions_Post
+    // 2.4: deliberately NO GetEngineFunctions / _Post. This plugin hooks no
+    // engine functions, and copying sizeof(enginefuncs_t) into metamod's
+    // buffer is an ABI trap: enginefuncs_t grew in metamod-p p105
+    // (pfnPEntityOfEntIndexAllEntities), so a plugin built with new headers
+    // overflows the table of an older metamod binary and crashes on load.
+    NULL,               // pfnGetEngineFunctions
+    NULL,               // pfnGetEngineFunctions_Post
 };
 
 C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo,
