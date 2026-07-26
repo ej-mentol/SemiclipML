@@ -120,14 +120,17 @@ if not exist "%VCVARS%" (
 call "%VCVARS%" x86 >nul
 
 :: --- Clean / Prepare Directories ---
-if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
+:: Full clean build every time: the project is three .cpp files, a rebuild
+:: costs seconds, and stale NMake object files have already produced
+:: confusing LNK2019 errors after header/source updates.
+if exist "%BUILD_DIR%" rmdir /S /Q "%BUILD_DIR%"
+mkdir "%BUILD_DIR%"
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
 :: --- Configure & Build ---
 echo.
 echo [INFO] Configuring CMake (!BUILD_TYPE!) in %BUILD_DIR%...
 cd /d "%BUILD_DIR%"
-if exist "CMakeCache.txt" del "CMakeCache.txt"
 
 cmake -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=!BUILD_TYPE! ..
 if %errorlevel% neq 0 (

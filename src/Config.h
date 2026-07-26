@@ -7,6 +7,18 @@ extern cvar_t cv_dist;
 extern cvar_t cv_trans;
 extern cvar_t cv_alpha;
 extern cvar_t cv_mode; // 0 = Radius (Standard), 1 = Platform (Hat)
+extern cvar_t cv_firethrough; // fire-through: think-window solid flip + projectile touch phase-through
+
+// Live cvar views: engine-side structs resolved via CVarGetPointer after
+// registration. Console changes land in the ENGINE's cvar storage; on Sven
+// the locally registered struct's .value stays frozen at its default, so all
+// runtime reads must go through these pointers.
+extern cvar_t *pv_enabled;
+extern cvar_t *pv_dist;
+extern cvar_t *pv_trans;
+extern cvar_t *pv_alpha;
+extern cvar_t *pv_mode;
+extern cvar_t *pv_firethrough;
 
 namespace Config {
 // Definitive Semiclip Constants

@@ -20,9 +20,9 @@ globalvars_t *gpGlobals;
 plugin_info_t Plugin_info = {
     META_INTERFACE_VERSION, // ifvers
     "SemiclipML",           // name
-    "2.4",                  // version
+    "2.5",                  // version
     "2026/07/26",           // date
-    "Necr",                 // author
+    "mentol",                 // author
     "",                     // url
     "SMC",                  // logtag
     PT_CHANGELEVEL,         // (when) loadable
@@ -38,14 +38,21 @@ void PluginInit() {
   std::memset(&g_dll_hooks_post, 0, sizeof(g_dll_hooks_post));
 
   g_dll_hooks.pfnPM_Move = Semiclip::OnPM_Move;
+  g_dll_hooks.pfnPlayerPreThink = Semiclip::OnPlayerPreThink;
+  g_dll_hooks.pfnTouch = Semiclip::OnTouch;
   g_dll_hooks.pfnClientDisconnect = Semiclip::OnClientDisconnect;
   g_dll_hooks.pfnServerDeactivate = Semiclip::OnServerDeactivate;
   // 2.4: post-hook restores pev->solid values flipped in OnPM_Move.
   // Without this registration the SOLID_NOT flips leak permanently.
   g_dll_hooks_post.pfnPM_Move = Semiclip::OnPM_Move_Post;
   g_dll_hooks_post.pfnAddToFullPack = Semiclip::OnAddToFullPack;
+  g_dll_hooks_post.pfnPlayerPostThink = Semiclip::OnPlayerPostThink_Post;
 
   Config::RegisterCVars();
+
+  if (g_engfuncs.pfnAddServerCommand) {
+    g_engfuncs.pfnAddServerCommand("smc_status", Semiclip::CmdStatus);
+  }
 }
 
 // Metamod Callbacks
@@ -139,6 +146,7 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
   // 2.4: if we unload between a pre/post pair, put pev->solid back first.
   Semiclip::RestoreTrackedSolidStates();
+  Semiclip::RestoreThinkWindowStates();
   Semiclip::ResetCapTracking();
   gpGamedllFuncs = nullptr;
   gpMetaGlobals = nullptr;

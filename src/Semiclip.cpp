@@ -3,9 +3,17 @@
 #include <array>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <unordered_map>
 
 namespace Semiclip {
+
+bool ShouldBeSolidLogic(const Vector &hostOrigin, const Vector &hostVelocity,
+                        int hostButtons, int hostOnGroundIdx,
+                        const Vector &targetOrigin, int targetMoveType,
+                        int targetDeadFlag, int targetIndex,
+                        int hostWaterLevel);
 
 namespace {
 
@@ -16,6 +24,29 @@ std::array<int, MAX_TRACKED_CLIENTS + 1> g_capTargetByHost{};
 // SOLID_NOT == 0, so a stored value of 0 is ambiguous with "not tracked".
 std::array<int, MAX_TRACKED_CLIENTS + 1> g_originalSolidState{};
 std::array<bool, MAX_TRACKED_CLIENTS + 1> g_solidTracked{};
+
+// Think-window (smc_firethrough) tracking: separate from the PM_Move-window
+// arrays above ON PURPOSE. Windows nest (PreThink -> PM_Move -> PostThink):
+// the move-window restore in OnPM_Move_Post must not close the outer think
+// window, so each window restores only its own records.
+std::array<int, MAX_TRACKED_CLIENTS + 1> g_thinkOriginalSolid{};
+std::array<bool, MAX_TRACKED_CLIENTS + 1> g_thinkSolidTracked{};
+
+// Pre-impact velocity cache for player-owned projectiles (smc_firethrough).
+// For BOUNCE-class movetypes the engine reflects velocity BEFORE dispatching
+// Touch, so at hook time proj->v.velocity may already point back at the
+// shooter; phasing along it flings the projectile backwards at angles that
+// depend on the impact normal. Snapshot velocities once per frame, before
+// entity physics runs, and phase along the cached (true flight) direction.
+std::unordered_map<int, Vector> g_projVelCache;
+float g_projVelCacheTime = -1.0f;
+
+// Deferred velocity restore: the engine applies ClipVelocity to the
+// projectile AFTER our touch hook returns, wiping whatever velocity we set
+// inside it. So the hook only schedules the restore here, and the per-frame
+// sweep applies it at the START of the next frame - before physics, where
+// nothing overwrites it anymore.
+std::unordered_map<int, Vector> g_projPendingRestore;
 
 // 2.4: one-shot warning flag for the tracking-leak invariant.
 bool g_warnedSolidLeak = false;
@@ -194,6 +225,130 @@ bool AnySolidTracked() {
   return false;
 }
 
+bool IsPhysicsProjectileMovetype(int mt) {
+  return mt == MOVETYPE_TOSS || mt == MOVETYPE_BOUNCE || mt == MOVETYPE_FLY ||
+         mt == MOVETYPE_FLYMISSILE || mt == MOVETYPE_BOUNCEMISSILE;
+}
+
+
+// -1 forces a status line on the first move after plugin load.
+int g_lastAnnouncedEnabled = -1;
+
+// --- Per-frame cvar snapshot -----------------------------------------------
+// Sven's reworked cvar system: console writes land in engine storage that
+// neither our registered structs NOR the CVarGetPointer result reflect
+// (verified live: FCVAR_SERVER change broadcast fires, reads stay stale).
+// pfnCVarGetFloat resolves by name through the same path the console uses,
+// so it cannot diverge. To keep the O(n) name lookup out of the per-entity
+// hot path, all six values are snapshotted at most once per server frame.
+struct LiveCVarValues {
+  float enabled = 1.0f;
+  float dist = 64.0f;
+  float trans = 120.0f;
+  float alpha = 120.0f;
+  float mode = 0.0f;
+  float firethrough = 0.0f;
+};
+
+LiveCVarValues g_cvv;
+float g_cvvLastRefresh = -1.0f;
+
+float ReadCVarByName(const char *name, cvar_t *fallback) {
+  if (g_engfuncs.pfnCVarGetFloat) {
+    return g_engfuncs.pfnCVarGetFloat(name);
+  }
+  return fallback ? fallback->value : 0.0f;
+}
+
+void RefreshCVars() {
+  if (!gpGlobals || gpGlobals->time == g_cvvLastRefresh) {
+    return;
+  }
+  g_cvvLastRefresh = gpGlobals->time;
+
+  g_cvv.enabled = ReadCVarByName("smc_enabled", pv_enabled);
+  g_cvv.dist = ReadCVarByName("smc_dist", pv_dist);
+  g_cvv.trans = ReadCVarByName("smc_trans_dist", pv_trans);
+  g_cvv.alpha = ReadCVarByName("smc_alpha", pv_alpha);
+  g_cvv.mode = ReadCVarByName("smc_mode", pv_mode);
+  g_cvv.firethrough = ReadCVarByName("smc_firethrough", pv_firethrough);
+}
+
+
+
+// Keep late joiners covered AND reassert the global mask every move — the
+// game dll may reset group state around its own traces, which would silently
+// disarm a one-shot SetGroupMask call.
+
+
+void RefreshProjVelCache() {
+  if (!gpGlobals || g_cvv.firethrough <= 0.0f ||
+      gpGlobals->time == g_projVelCacheTime ||
+      !g_engfuncs.pfnPEntityOfEntIndex) {
+    return;
+  }
+  g_projVelCacheTime = gpGlobals->time;
+
+  // Apply deferred restores scheduled by superceded touches last frame.
+  for (const auto &pending : g_projPendingRestore) {
+    edict_t *ent = g_engfuncs.pfnPEntityOfEntIndex(pending.first);
+    if (ent && !FNullEnt(ent) && !ent->free &&
+        IsPhysicsProjectileMovetype(ent->v.movetype)) {
+      ent->v.velocity = pending.second;
+      ent->v.flags &= ~FL_ONGROUND; // the engine may have parked it
+      ent->v.groundentity = nullptr;
+    }
+  }
+  g_projPendingRestore.clear();
+
+  g_projVelCache.clear();
+
+  const int maxEnts = gpGlobals->maxEntities;
+  for (int i = gpGlobals->maxClients + 1; i < maxEnts; i++) {
+    edict_t *ent = g_engfuncs.pfnPEntityOfEntIndex(i);
+    if (!ent || FNullEnt(ent) || ent->free ||
+        !IsPhysicsProjectileMovetype(ent->v.movetype)) {
+      continue;
+    }
+    edict_t *owner = ent->v.owner;
+    if (owner && !FNullEnt(owner) && !owner->free &&
+        (owner->v.flags & (FL_CLIENT | FL_FAKECLIENT)) != 0) {
+      g_projVelCache[i] = ent->v.velocity;
+    }
+  }
+}
+
+// Edict-level pair decision shared by AddToFullPack, the think window and the
+// touch filter: should `ent` be solid from `host`'s point of view right now?
+bool PairShouldBeSolid(edict_t *host, edict_t *ent, int mode) {
+  if (!host || !ent || FNullEnt(host) || FNullEnt(ent) || host->free ||
+      ent->free) {
+    return true;
+  }
+
+  const int hostIdx = GetHostIndex(host);
+  const int targetIdx = ENTINDEX(ent);
+  const bool is_player = (ent->v.flags & (FL_CLIENT | FL_FAKECLIENT)) != 0;
+
+  if (mode == 1 && is_player) {
+    const bool latched =
+        (hostIdx != 0 && g_capTargetByHost[hostIdx] == targetIdx);
+    return latched && ShouldUseCapForEdicts(host, ent, true);
+  }
+
+  int hostOnGroundIdx = -1;
+  if (host->v.groundentity) {
+    edict_t *ground = host->v.groundentity;
+    if (!FNullEnt(ground) && !ground->free) {
+      hostOnGroundIdx = ENTINDEX(ground);
+    }
+  }
+
+  return ShouldBeSolidLogic(host->v.origin, host->v.velocity, host->v.button,
+                            hostOnGroundIdx, ent->v.origin, ent->v.movetype,
+                            ent->v.deadflag, targetIdx, host->v.waterlevel);
+}
+
 } // namespace
 
 bool ShouldBeSolidLogic(
@@ -216,7 +371,7 @@ bool ShouldBeSolidLogic(
   float dx = hostOrigin.x - targetOrigin.x;
   float dy = hostOrigin.y - targetOrigin.y;
   float d2 = dx * dx + dy * dy;
-  float smc_dist = cv_dist.value;
+  float smc_dist = g_cvv.dist;
 
   if (d2 >= (smc_dist * smc_dist)) {
     return true;
@@ -282,6 +437,8 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
   if (!ppmove || !gpGlobals)
     return;
 
+  RefreshCVars();
+
   // 2.4 INVARIANT: tracking must be empty at the start of every PM_Move.
   // If it isn't, the post-hook restore did not run for the previous move
   // (hook not registered / another plugin superseded us). Self-heal and
@@ -298,7 +455,21 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
     }
   }
 
-  if (cv_enabled.value <= 0.0f)
+  // Honest status: announce enable/disable transitions in the server console
+  // so the admin knows the toggle took effect immediately (no reload needed).
+  const bool enabledNow = g_cvv.enabled > 0.0f;
+  if (g_lastAnnouncedEnabled != (int)enabledNow) {
+    g_lastAnnouncedEnabled = (int)enabledNow;
+    if (g_engfuncs.pfnServerPrint) {
+      g_engfuncs.pfnServerPrint(
+          enabledNow
+              ? "[SMC] smc_enabled 1: semiclip checks and transparency ACTIVE\n"
+              : "[SMC] smc_enabled 0: ALL semiclip checks and transparency "
+                "OFF - effective immediately, no map reload needed\n");
+    }
+  }
+
+  if (!enabledNow)
     return;
 
   const int hostIdx = ppmove->player_index + 1;
@@ -315,7 +486,7 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
 
   const int original_numphysent = ppmove->numphysent;
   int numphysent = 0;
-  int mode = (int)cv_mode.value;
+  int mode = (int)g_cvv.mode;
   const int effectiveButtons = GetEffectiveButtons(hostIdx, ppmove->cmd.buttons);
   const int resolvedGroundIdx =
       ResolvePMGroundEntityIndex(ppmove, original_numphysent);
@@ -433,7 +604,8 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
   if (gpMetaGlobals) {
     gpMetaGlobals->mres = MRES_IGNORED;
   }
-  if (cv_enabled.value <= 0.0f || !gpGlobals)
+  RefreshCVars();
+  if (g_cvv.enabled <= 0.0f || !gpGlobals)
     return 1;
   if (!state || !ent || !host)
     return 1;
@@ -457,31 +629,11 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
   if (!is_player && !is_corpse)
     return 1;
 
-  int mode = static_cast<int>(cv_mode.value);
+  int mode = static_cast<int>(g_cvv.mode);
   bool shouldBeSolid = true;
-  const int hostIdx = GetHostIndex(host);
-  const int targetIdx = ENTINDEX(ent);
 
-  if (mode == 1 && is_player) {
-      const bool latched =
-          (hostIdx != 0 && g_capTargetByHost[hostIdx] == targetIdx);
-      shouldBeSolid = latched && ShouldUseCapForEdicts(host, ent, true);
-  }
-  else {
-      int hostOnGroundIdx = -1;
-      if (host->v.groundentity) {
-        edict_t *ground = host->v.groundentity;
-        if (!FNullEnt(ground) && !ground->free) {
-          hostOnGroundIdx = ENTINDEX(ground);
-        }
-      }
-
-      shouldBeSolid = ShouldBeSolidLogic(
-          host->v.origin, host->v.velocity,
-          host->v.button, 
-          hostOnGroundIdx, ent->v.origin, ent->v.movetype, ent->v.deadflag,
-          targetIdx,
-          host->v.waterlevel);
+  if (is_player || is_corpse) {
+      shouldBeSolid = PairShouldBeSolid(host, ent, mode);
   }
 
   if (!shouldBeSolid) {
@@ -495,11 +647,11 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
     float dx = state->origin.x - host->v.origin.x;
     float dy = state->origin.y - host->v.origin.y;
     float d2 = dx * dx + dy * dy;
-    float transDist = cv_trans.value;
+    float transDist = g_cvv.trans;
 
     if (d2 < (transDist * transDist) && transDist > 0.01f) {
       float dist = std::sqrt(d2);
-      float minAlpha = std::clamp(cv_alpha.value, 0.0f, 255.0f);
+      float minAlpha = std::clamp(g_cvv.alpha, 0.0f, 255.0f);
       const float solidMinAlpha = (minAlpha > 235.0f) ? minAlpha : 235.0f;
       const int alpha = shouldBeSolid
                             ? ComputeFadeAlpha(dist, transDist, solidMinAlpha)
@@ -512,6 +664,196 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
   }
 
   return 1;
+}
+
+
+void RestoreThinkWindowStates() {
+  for (int i = 1; i <= MAX_TRACKED_CLIENTS; i++) {
+    if (!g_thinkSolidTracked[i]) {
+      continue;
+    }
+
+    edict_t *ent = EdictFromIndex(i);
+    if (ent) {
+      ent->v.solid = g_thinkOriginalSolid[i];
+    }
+
+    g_thinkSolidTracked[i] = false;
+    g_thinkOriginalSolid[i] = 0;
+  }
+}
+
+void OnPlayerPreThink(edict_t *pEntity) {
+  if (gpMetaGlobals) {
+    gpMetaGlobals->mres = MRES_IGNORED;
+  }
+  if (!pEntity || !gpGlobals) {
+    return;
+  }
+
+  RefreshCVars();
+  RefreshProjVelCache();
+
+  // Invariant: the previous player's think window must be closed by now.
+  // Self-heal like the PM_Move invariant does.
+  bool leftover = false;
+  for (int i = 1; i <= MAX_TRACKED_CLIENTS; i++) {
+    if (g_thinkSolidTracked[i]) { leftover = true; break; }
+  }
+  if (leftover) {
+    RestoreThinkWindowStates();
+  }
+
+  if (g_cvv.enabled <= 0.0f || g_cvv.firethrough <= 0.0f) {
+    return;
+  }
+
+  const int hostIdx = GetHostIndex(pEntity);
+  if (hostIdx == 0) {
+    return;
+  }
+
+  const int mode = (int)g_cvv.mode;
+  const int maxClients =
+      (gpGlobals->maxClients < MAX_TRACKED_CLIENTS) ? gpGlobals->maxClients
+                                                    : MAX_TRACKED_CLIENTS;
+  for (int i = 1; i <= maxClients; i++) {
+    if (i == hostIdx) {
+      continue;
+    }
+
+    edict_t *target = EdictFromIndex(i);
+    if (!target) {
+      continue;
+    }
+
+    if (!PairShouldBeSolid(pEntity, target, mode) && !g_thinkSolidTracked[i]) {
+      g_thinkSolidTracked[i] = true;
+      g_thinkOriginalSolid[i] = target->v.solid;
+      target->v.solid = SOLID_NOT;
+    }
+  }
+}
+
+void OnPlayerPostThink_Post(edict_t *pEntity) {
+  if (gpMetaGlobals) {
+    gpMetaGlobals->mres = MRES_IGNORED;
+  }
+
+  // Weapon fire (ItemPostFrame) has run inside the game dll's PostThink by
+  // the time this post hook executes - close the window.
+  RestoreThinkWindowStates();
+}
+
+void OnTouch(edict_t *pentTouched, edict_t *pentOther) {
+  if (gpMetaGlobals) {
+    gpMetaGlobals->mres = MRES_IGNORED;
+  }
+  if (!pentTouched || !pentOther || !gpGlobals) {
+    return;
+  }
+
+  RefreshCVars();
+  if (g_cvv.enabled <= 0.0f || g_cvv.firethrough <= 0.0f) {
+    return;
+  }
+
+  // Identify (projectile, player) in either argument order.
+  edict_t *proj = nullptr;
+  edict_t *playerEnt = nullptr;
+  if (IsPhysicsProjectileMovetype(pentTouched->v.movetype) &&
+      (pentOther->v.flags & (FL_CLIENT | FL_FAKECLIENT)) != 0) {
+    proj = pentTouched;
+    playerEnt = pentOther;
+  } else if (IsPhysicsProjectileMovetype(pentOther->v.movetype) &&
+             (pentTouched->v.flags & (FL_CLIENT | FL_FAKECLIENT)) != 0) {
+    proj = pentOther;
+    playerEnt = pentTouched;
+  } else {
+    return;
+  }
+
+  edict_t *owner = proj->v.owner;
+  if (!owner || FNullEnt(owner) || owner->free || owner == playerEnt ||
+      (owner->v.flags & (FL_CLIENT | FL_FAKECLIENT)) == 0) {
+    return;
+  }
+
+  // Owner and touched player are currently semiclipped with each other:
+  // suppress the game dll's touch (no damage, no detonation, no stick).
+  if (!PairShouldBeSolid(owner, playerEnt, (int)g_cvv.mode) && gpMetaGlobals) {
+    gpMetaGlobals->mres = MRES_SUPERCEDE;
+
+    // The engine has already stopped the projectile physically; its default
+    // response deflects it (bolts spring back off bodies). Phase it through
+    // instead: advance the origin past the body along the flight direction,
+    // keeping velocity. A world-only trace caps the nudge so we never
+    // teleport into a wall right behind the player.
+    Vector vel = proj->v.velocity;
+    const int projIdx = ENTINDEX(proj);
+    auto cached = g_projVelCache.find(projIdx);
+    if (cached != g_projVelCache.end()) {
+      vel = cached->second; // true pre-impact flight vector
+    }
+    const float speed2 = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
+    if (speed2 > 1.0f && g_engfuncs.pfnTraceLine && g_engfuncs.pfnSetOrigin) {
+      const float invLen = 1.0f / std::sqrt(speed2);
+      const Vector dir(vel.x * invLen, vel.y * invLen, vel.z * invLen);
+      constexpr float NUDGE_MAX = 72.0f;
+
+      Vector start = proj->v.origin;
+      Vector end = start + dir * NUDGE_MAX;
+      TraceResult tr{};
+      g_engfuncs.pfnTraceLine(start, end, 1 /* ignore monsters/players */,
+                              proj, &tr);
+
+      const float dist = NUDGE_MAX * tr.flFraction - 4.0f;
+      if (dist > 8.0f) {
+        Vector dest = start + dir * dist;
+        g_engfuncs.pfnSetOrigin(proj, dest);
+        proj->v.velocity = vel;               // may be wiped post-touch...
+        g_projPendingRestore[projIdx] = vel;  // ...so reassert next frame
+        g_projVelCache[projIdx] = vel;
+      }
+    }
+  }
+}
+
+void CmdStatus() {
+  if (!gpGlobals || !g_engfuncs.pfnServerPrint) {
+    return;
+  }
+
+  g_engfuncs.pfnServerPrint(
+      "[SMC] idx name             solid grp iuser4 effects rmode ramt mtype "
+      "dead trkM trkT\n");
+
+  const int maxClients =
+      (gpGlobals->maxClients < MAX_TRACKED_CLIENTS) ? gpGlobals->maxClients
+                                                    : MAX_TRACKED_CLIENTS;
+  for (int i = 1; i <= maxClients; i++) {
+    edict_t *ent = EdictFromIndex(i);
+    char line[224];
+    if (!ent) {
+      snprintf(line, sizeof(line), "[SMC] %3d <empty>\n", i);
+    } else {
+      const char *name = STRING(ent->v.netname);
+      snprintf(line, sizeof(line),
+               "[SMC] %3d %-16.16s %5d %3d %6d %7d %5d %4d %5d %4d %4d %4d\n",
+               i, (name && name[0]) ? name : "-", ent->v.solid,
+               ent->v.groupinfo, ent->v.iuser4, (int)ent->v.effects,
+               ent->v.rendermode, (int)ent->v.renderamt, ent->v.movetype,
+               ent->v.deadflag, (int)g_solidTracked[i],
+               (int)g_thinkSolidTracked[i]);
+    }
+    g_engfuncs.pfnServerPrint(line);
+  }
+
+  char tail[160];
+  snprintf(tail, sizeof(tail),
+           "[SMC] expected for a live visible player: solid=3 grp=0 iuser4=0 "
+           "effects w/o 128(EF_NODRAW) rmode>=0 trk=0/0\n");
+  g_engfuncs.pfnServerPrint(tail);
 }
 
 void OnClientDisconnect(edict_t *client) {
@@ -527,7 +869,10 @@ void OnServerDeactivate() {
     gpMetaGlobals->mres = MRES_IGNORED;
   }
 
+  g_projVelCache.clear();
+  g_projPendingRestore.clear();
   RestoreTrackedSolidStates();
+  RestoreThinkWindowStates();
   ResetCapTracking();
 }
 
