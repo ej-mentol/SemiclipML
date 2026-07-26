@@ -1,6 +1,6 @@
 # SemiclipML
 
-**Warning:** Windows build. Tested on a LAN server with bots; broader multiplayer testing is ongoing.
+**Warning:** The Windows build is tested on a LAN server with bots; broader multiplayer testing is ongoing. The Linux build (`SemiclipML.so`) compiles cleanly but has **not** been run on a live Sven Co-op server yet - treat it as untested.
 
 *Note: This project was developed with AI assistance. Collision logic and edict handling were fine-tuned for Sven Co-op.*
 
@@ -40,7 +40,11 @@ cd SemiclipML
 compile_win.bat
 ```
 
-If you already cloned without `--recursive`, run `git submodule update --init --recursive` (the build script also attempts this automatically). Requirements: Visual Studio 2017–2026 with the "Desktop development with C++" workload (x86 tools), CMake 3.10+. The script performs a clean build every run and offers to deploy the DLL to your server (the chosen path is remembered in `deploy_path.local.txt`).
+If you already cloned without `--recursive`, run `git submodule update --init --recursive` (the build scripts also attempt this automatically).
+
+**Windows**: Visual Studio 2017–2026 with the "Desktop development with C++" workload (x86 tools), CMake 3.10+. `compile_win.bat` performs a clean build every run and offers to deploy the DLL to your server (the chosen path is remembered in `deploy_path.local.txt`).
+
+**Linux**: `sudo apt install build-essential gcc-multilib g++-multilib cmake`, then `./compile_linux.sh` - produces a 32-bit `bin/SemiclipML.so`. Builds and links cleanly, but see the warning at the top: it has not been validated on a live server yet. Reports welcome.
 
 ## Technical Overview
 * **Movement**: `PM_Move` pre-hook filters the physents list; `pev->solid` is flipped for the duration of each player move and restored in the post-hook, so server-side traces agree with movement physics. A runtime invariant self-heals and logs an error if a restore ever fails to run.
