@@ -1,0 +1,3 @@
+[submodule "thirdparty/metamod-p"]
+	path = thirdparty/metamod-p
+	url = https://github.com/Bots-United/metamod-p.git
