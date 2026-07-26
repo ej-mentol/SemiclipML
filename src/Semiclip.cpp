@@ -12,13 +12,13 @@ namespace {
 constexpr int MAX_TRACKED_CLIENTS = 32;
 std::array<int, MAX_TRACKED_CLIENTS + 1> g_capTargetByHost{};
 
-float GetCVarFloat(const char *name, float fallback) {
-  if (g_engfuncs.pfnCVarGetFloat) {
-    return g_engfuncs.pfnCVarGetFloat(name);
-  }
+// 2.4: separate "tracked" flag instead of using 0 as a sentinel value.
+// SOLID_NOT == 0, so a stored value of 0 is ambiguous with "not tracked".
+std::array<int, MAX_TRACKED_CLIENTS + 1> g_originalSolidState{};
+std::array<bool, MAX_TRACKED_CLIENTS + 1> g_solidTracked{};
 
-  return fallback;
-}
+// 2.4: one-shot warning flag for the tracking-leak invariant.
+bool g_warnedSolidLeak = false;
 
 edict_t *EdictFromIndex(int index) {
   if (index < 1 || index > MAX_TRACKED_CLIENTS ||
@@ -48,12 +48,7 @@ int ResolvePMGroundEntityIndex(playermove_s *ppmove, int originalNumPhysent) {
     return -1;
   }
 
-  const physent_t &ground = ppmove->physents[ppmove->onground];
-  if (ground.info > 0) {
-    return ground.info;
-  }
-
-  return ppmove->onground;
+  return ppmove->physents[ppmove->onground].info;
 }
 
 bool IsCorpseLike(int moveType, int deadFlag) {
@@ -150,11 +145,22 @@ int ComputeFadeAlpha(float dist, float transDist, float minAlpha) {
   return static_cast<int>(minAlpha + (255.0f - minAlpha) * easedRatio);
 }
 
-void ApplyCapBounds(physent_t *pe, float radius) {
-  pe->mins.x = -radius;
-  pe->mins.y = -radius;
-  pe->maxs.x = radius;
-  pe->maxs.y = radius;
+// 2.4: origMins/origMaxs MUST be copies, not references into *pe —
+// this function mutates pe->mins/pe->maxs, so passing pe's own fields
+// by reference would alias the values being read. See call site.
+void ApplyCapBounds(physent_t *pe, float radius, bool latched,
+                    const Vector &origMins, const Vector &origMaxs) {
+  if (!latched) {
+    pe->mins.x = (std::min)(origMins.x, -radius);
+    pe->mins.y = (std::min)(origMins.y, -radius);
+    pe->maxs.x = (std::max)(origMaxs.x, radius);
+    pe->maxs.y = (std::max)(origMaxs.y, radius);
+  } else {
+    pe->mins.x = -radius;
+    pe->mins.y = -radius;
+    pe->maxs.x = radius;
+    pe->maxs.y = radius;
+  }
   pe->mins.z = pe->maxs.z - Config::CAP_PLATFORM_THICKNESS;
 }
 
@@ -179,13 +185,22 @@ void ResetCapTargetForIndex(int index) {
   g_capTargetByHost[index] = 0;
 }
 
+bool AnySolidTracked() {
+  for (int i = 1; i <= MAX_TRACKED_CLIENTS; i++) {
+    if (g_solidTracked[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 } // namespace
 
 bool ShouldBeSolidLogic(
     const Vector &hostOrigin, const Vector &hostVelocity, int hostButtons,
     int hostOnGroundIdx, const Vector &targetOrigin, int targetMoveType,
     int targetDeadFlag, int targetIndex,
-    int hostWaterLevel = 0
+    int hostWaterLevel
 ) {
   // === CHECK 1: CORPSE FILTER ===
   if (IsCorpseLike(targetMoveType, targetDeadFlag)) {
@@ -267,7 +282,23 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
   if (!ppmove || !gpGlobals)
     return;
 
-  if (GetCVarFloat("smc_enabled", cv_enabled.value) <= 0.0f)
+  // 2.4 INVARIANT: tracking must be empty at the start of every PM_Move.
+  // If it isn't, the post-hook restore did not run for the previous move
+  // (hook not registered / another plugin superseded us). Self-heal and
+  // shout once so the failure mode is visible instead of silent.
+  if (AnySolidTracked()) {
+    RestoreTrackedSolidStates();
+    if (!g_warnedSolidLeak) {
+      g_warnedSolidLeak = true;
+      if (gpMetaUtilFuncs) {
+        LOG_ERROR(PLID,
+                  "solid tracking not empty at PM_Move start; "
+                  "PM_Move post-hook did not run. Self-healed, investigate.");
+      }
+    }
+  }
+
+  if (cv_enabled.value <= 0.0f)
     return;
 
   const int hostIdx = ppmove->player_index + 1;
@@ -284,7 +315,7 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
 
   const int original_numphysent = ppmove->numphysent;
   int numphysent = 0;
-  int mode = (int)GetCVarFloat("smc_mode", cv_mode.value);
+  int mode = (int)cv_mode.value;
   const int effectiveButtons = GetEffectiveButtons(hostIdx, ppmove->cmd.buttons);
   const int resolvedGroundIdx =
       ResolvePMGroundEntityIndex(ppmove, original_numphysent);
@@ -307,6 +338,11 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
       const int targetIdx = pe->info;
       if (targetIdx < 1 || targetIdx > gpGlobals->maxClients ||
           targetIdx == hostIdx) {
+        continue;
+      }
+
+      edict_t *targetEnt = EdictFromIndex(targetIdx);
+      if (targetEnt && IsCorpseLike(targetEnt->v.movetype, targetEnt->v.deadflag)) {
         continue;
       }
 
@@ -340,9 +376,17 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
       int targetIdx = pe->info;
 
       if (targetIdx >= 1 && targetIdx <= gpGlobals->maxClients && targetIdx != hostIdx) {
+        edict_t *targetEnt = EdictFromIndex(targetIdx);
+        int targetDeadFlag = targetEnt ? targetEnt->v.deadflag : DEAD_NO;
+        int targetMoveType = targetEnt ? targetEnt->v.movetype : pe->movetype;
+
         if (mode == 1) {
             if (i == selectedPhysentIdx) {
-              ApplyCapBounds(pe, GetCapRadius(selectedLatched));
+              // 2.4: take copies BEFORE ApplyCapBounds mutates pe->mins/maxs.
+              const Vector origMins = pe->mins;
+              const Vector origMaxs = pe->maxs;
+              ApplyCapBounds(pe, GetCapRadius(selectedLatched), selectedLatched,
+                             origMins, origMaxs);
               nextCapTarget = selectedTargetIdx;
             } else {
               keep = false;
@@ -351,9 +395,18 @@ void OnPM_Move(struct playermove_s *ppmove, int server) {
         else {
             if (!ShouldBeSolidLogic(
                     ppmove->origin, ppmove->velocity, effectiveButtons,
-                    resolvedGroundIdx, pe->origin, pe->movetype, 0, targetIdx,
+                    resolvedGroundIdx, pe->origin, targetMoveType, targetDeadFlag, targetIdx,
                     ppmove->waterlevel)) {
               keep = false;
+
+              // Flip pev->solid synchronously for radius mode so server-side
+              // traces (lag comp, unstuck) agree with movement. Restored in
+              // OnPM_Move_Post.
+              if (targetEnt && !g_solidTracked[targetIdx]) {
+                g_solidTracked[targetIdx] = true;
+                g_originalSolidState[targetIdx] = targetEnt->v.solid;
+                targetEnt->v.solid = SOLID_NOT;
+              }
             }
         }
       }
@@ -380,9 +433,14 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
   if (gpMetaGlobals) {
     gpMetaGlobals->mres = MRES_IGNORED;
   }
-  if (GetCVarFloat("smc_enabled", cv_enabled.value) <= 0.0f || !gpGlobals)
+  if (cv_enabled.value <= 0.0f || !gpGlobals)
     return 1;
   if (!state || !ent || !host)
+    return 1;
+
+  // 2.4: this is a POST hook. If the game dll decided not to add this
+  // entity to the pack, state is not going to the client — leave it alone.
+  if (gpMetaGlobals && META_RESULT_ORIG_RET(int) == 0)
     return 1;
 
   if (FNullEnt(ent) || FNullEnt(host))
@@ -399,7 +457,7 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
   if (!is_player && !is_corpse)
     return 1;
 
-  int mode = static_cast<int>(GetCVarFloat("smc_mode", cv_mode.value));
+  int mode = static_cast<int>(cv_mode.value);
   bool shouldBeSolid = true;
   const int hostIdx = GetHostIndex(host);
   const int targetIdx = ENTINDEX(ent);
@@ -430,7 +488,10 @@ int OnAddToFullPack(struct entity_state_s *state, int e, edict_t *ent,
     state->solid = SOLID_NOT;
   }
 
-  if (is_player && ent->v.waterlevel == 0) {
+  // 2.4: don't stomp custom render states set by the map / game
+  // (invisibility, glow shells, scripted effects).
+  if (is_player && ent->v.waterlevel == 0 &&
+      ent->v.rendermode == kRenderNormal) {
     float dx = state->origin.x - host->v.origin.x;
     float dy = state->origin.y - host->v.origin.y;
     float d2 = dx * dx + dy * dy;
@@ -466,11 +527,37 @@ void OnServerDeactivate() {
     gpMetaGlobals->mres = MRES_IGNORED;
   }
 
+  RestoreTrackedSolidStates();
   ResetCapTracking();
 }
 
 void ResetCapTracking() {
   g_capTargetByHost.fill(0);
+}
+
+void RestoreTrackedSolidStates() {
+  for (int i = 1; i <= MAX_TRACKED_CLIENTS; i++) {
+    if (!g_solidTracked[i]) {
+      continue;
+    }
+
+    edict_t *ent = EdictFromIndex(i);
+    if (ent) {
+      ent->v.solid = g_originalSolidState[i];
+    }
+
+    g_solidTracked[i] = false;
+    g_originalSolidState[i] = 0;
+  }
+}
+
+void OnPM_Move_Post(struct playermove_s *ppmove, int server) {
+  if (gpMetaGlobals) {
+    gpMetaGlobals->mres = MRES_IGNORED;
+  }
+
+  // Restore pev->solid values flipped during OnPM_Move for this move.
+  RestoreTrackedSolidStates();
 }
 
 } // namespace Semiclip
