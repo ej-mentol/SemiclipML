@@ -7,29 +7,28 @@ extern cvar_t cv_dist;
 extern cvar_t cv_trans;
 extern cvar_t cv_alpha;
 extern cvar_t cv_mode; // 0 = Radius (Standard), 1 = Platform (Hat)
-extern cvar_t cv_firethrough; // fire-through: think-window solid flip + projectile touch phase-through
-
-// Live cvar views: engine-side structs resolved via CVarGetPointer after
-// registration. Console changes land in the ENGINE's cvar storage; on Sven
-// the locally registered struct's .value stays frozen at its default, so all
-// runtime reads must go through these pointers.
-extern cvar_t *pv_enabled;
-extern cvar_t *pv_dist;
-extern cvar_t *pv_trans;
-extern cvar_t *pv_alpha;
-extern cvar_t *pv_mode;
-extern cvar_t *pv_firethrough;
+extern cvar_t cv_melee;
+extern cvar_t cv_melee_range;
+extern cvar_t cv_firethrough;
 
 namespace Config {
+// Default CVar values
+constexpr float DEF_DIST = 64.0f;
+constexpr float DEF_TRANS_DIST = 120.0f;
+constexpr float DEF_ALPHA = 120.0f;
+constexpr float DEF_MELEE_RANGE = 96.0f;
+constexpr const char *DEF_MELEE_LIST = "crowbar,wrench,medkit,barnacle,knife,grapple,pipe";
+
+// Sven Co-op 5.16+ expands physents from 600 (HLSDK MAX_PHYSENTS) to 1024
+constexpr int MAX_PHYSENTS_SVEN = 1024;
+
 // Definitive Semiclip Constants
 constexpr float FLOAT_CROUCH = 39.0f; // Minimum height for any stacking
 constexpr float SAFE_HEIGHT = 46.0f;  // Safe landing height
-constexpr float CENTER_BOX =
-    28.0f; // Box check radius (Reduced to 28.0 per user request)
-constexpr float OVERLAP_Z = 45.0f;  // Vertical overlap protection
-constexpr float OVERLAP_XY = 38.0f; // Horizontal overlap protection
-constexpr float JUMP_THRESHOLD = 0.0f;   // Any upward velocity = jumping
-constexpr float FALL_THRESHOLD = -10.0f; // Stable falling velocity
+constexpr float CENTER_BOX = 20.0f;   // Box check radius
+constexpr float OVERLAP_Z = 45.0f;    // Vertical overlap protection
+constexpr float OVERLAP_XY = 38.0f;   // Horizontal overlap protection
+constexpr float JUMP_THRESHOLD = 0.0f; // Any upward velocity = jumping
 
 // Mode 1 "cap" tuning. The acquire thresholds are intentionally tighter than
 // the hold thresholds to reduce state flapping and edge pushes.
