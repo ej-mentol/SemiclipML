@@ -3,22 +3,15 @@
 #include <extdll.h>
 #include <h_export.h>
 #include <meta_api.h>
+#include <engine_api.h>
 #include <cstring>
 
-#if defined(__GNUC__)
-// Old HLSDK structs (plugin_info_t, cvar_t) and engine prototypes take
-// non-const char*; the string literals we pass are never written to.
-// Compiler-level guard on purpose: gcc AND clang warn (-Wwrite-strings),
-// MSVC does not - this is about the compiler, not the OS.
-#pragma GCC diagnostic ignored "-Wwrite-strings"
-#endif
-
 // Global vars
-meta_globals_t *gpMetaGlobals;
-gamedll_funcs_t *gpGamedllFuncs;
-mutil_funcs_t *gpMetaUtilFuncs;
+meta_globals_t *gpMetaGlobals = nullptr;
+gamedll_funcs_t *gpGamedllFuncs = nullptr;
+mutil_funcs_t *gpMetaUtilFuncs = nullptr;
 enginefuncs_t g_engfuncs;
-globalvars_t *gpGlobals;
+globalvars_t *gpGlobals = nullptr;
 
 #if defined(_WIN32) && defined(_M_IX86)
 #pragma comment(linker, "/EXPORT:GiveFnptrsToDll=_GiveFnptrsToDll@8")
@@ -26,40 +19,42 @@ globalvars_t *gpGlobals;
 
 // Plugin info
 plugin_info_t Plugin_info = {
-    META_INTERFACE_VERSION, // ifvers
-    "SemiclipML",           // name
-    "2.5",                  // version
-    "2026/07/26",           // date
-    "Necr",                 // author
-    "",                     // url
-    "SMC",                  // logtag
-    PT_CHANGELEVEL,         // (when) loadable
-    PT_CHANGELEVEL,         // (when) unloadable
+    META_INTERFACE_VERSION,           // ifvers
+    const_cast<char *>("SemiclipML"), // name
+    const_cast<char *>("2.8"),        // version
+    const_cast<char *>("2026/11/02"), // date
+    const_cast<char *>("Necr"),       // author
+    const_cast<char *>(""),           // url
+    const_cast<char *>("SMC"),        // logtag
+    PT_CHANGELEVEL,                   // (when) loadable
+    PT_NEVER,                         // (when) unloadable
 };
 
-DLL_FUNCTIONS g_dll_hooks;
-static DLL_FUNCTIONS g_dll_hooks_post;
+static DLL_FUNCTIONS gFunctionTable;
+static DLL_FUNCTIONS gFunctionTable_Post;
+static NEW_DLL_FUNCTIONS gNewDLLFunctionTable;
 
-// Initialization
-void PluginInit() {
-  std::memset(&g_dll_hooks, 0, sizeof(g_dll_hooks));
-  std::memset(&g_dll_hooks_post, 0, sizeof(g_dll_hooks_post));
+static void PluginInit() {
+  std::memset(&gFunctionTable, 0, sizeof(gFunctionTable));
+  std::memset(&gFunctionTable_Post, 0, sizeof(gFunctionTable_Post));
 
-  g_dll_hooks.pfnPM_Move = Semiclip::OnPM_Move;
-  g_dll_hooks.pfnPlayerPreThink = Semiclip::OnPlayerPreThink;
-  g_dll_hooks.pfnTouch = Semiclip::OnTouch;
-  g_dll_hooks.pfnClientDisconnect = Semiclip::OnClientDisconnect;
-  g_dll_hooks.pfnServerDeactivate = Semiclip::OnServerDeactivate;
-  // 2.4: post-hook restores pev->solid values flipped in OnPM_Move.
-  // Without this registration the SOLID_NOT flips leak permanently.
-  g_dll_hooks_post.pfnPM_Move = Semiclip::OnPM_Move_Post;
-  g_dll_hooks_post.pfnAddToFullPack = Semiclip::OnAddToFullPack;
-  g_dll_hooks_post.pfnPlayerPostThink = Semiclip::OnPlayerPostThink_Post;
+  gFunctionTable.pfnPM_Move = Semiclip::OnPM_Move;
+  gFunctionTable.pfnPlayerPreThink = Semiclip::OnPlayerPreThink;
+  gFunctionTable.pfnTouch = Semiclip::OnTouch;
+  gFunctionTable.pfnBlocked = Semiclip::OnBlocked;
+  gFunctionTable.pfnPlayerPostThink = Semiclip::OnPlayerPostThink;
+  gFunctionTable.pfnClientDisconnect = Semiclip::OnClientDisconnect;
+  gFunctionTable.pfnServerDeactivate = Semiclip::OnServerDeactivate;
+
+  gFunctionTable_Post.pfnPM_Move = Semiclip::OnPM_Move_Post;
+  gFunctionTable_Post.pfnAddToFullPack = Semiclip::OnAddToFullPack;
+  gFunctionTable_Post.pfnPlayerPostThink = Semiclip::OnPlayerPostThink_Post;
+  gFunctionTable_Post.pfnStartFrame = Semiclip::OnStartFrame;
 
   Config::RegisterCVars();
 
   if (g_engfuncs.pfnAddServerCommand) {
-    g_engfuncs.pfnAddServerCommand("smc_status", Semiclip::CmdStatus);
+    g_engfuncs.pfnAddServerCommand(const_cast<char *>("smc_status"), Semiclip::CmdStatus);
   }
 }
 
@@ -69,13 +64,11 @@ C_DLLEXPORT int GetEntityAPI2(DLL_FUNCTIONS *pFunctionTable,
   if (!pFunctionTable || !interfaceVersion) {
     return FALSE;
   }
-
   if (*interfaceVersion != INTERFACE_VERSION) {
     *interfaceVersion = INTERFACE_VERSION;
     return FALSE;
   }
-
-  std::memcpy(pFunctionTable, &g_dll_hooks, sizeof(DLL_FUNCTIONS));
+  std::memcpy(pFunctionTable, &gFunctionTable, sizeof(DLL_FUNCTIONS));
   return TRUE;
 }
 
@@ -84,22 +77,56 @@ C_DLLEXPORT int GetEntityAPI2_Post(DLL_FUNCTIONS *pFunctionTable,
   if (!pFunctionTable || !interfaceVersion) {
     return FALSE;
   }
-
   if (*interfaceVersion != INTERFACE_VERSION) {
     *interfaceVersion = INTERFACE_VERSION;
     return FALSE;
   }
+  std::memcpy(pFunctionTable, &gFunctionTable_Post, sizeof(DLL_FUNCTIONS));
+  return TRUE;
+}
 
-  std::memcpy(pFunctionTable, &g_dll_hooks_post, sizeof(DLL_FUNCTIONS));
+C_DLLEXPORT int GetEngineFunctions(enginefuncs_t *t, int *ver) {
+  if (!t || !ver) return FALSE;
+  if (*ver != ENGINE_INTERFACE_VERSION) {
+    *ver = ENGINE_INTERFACE_VERSION;
+    return FALSE;
+  }
+  t->pfnTraceLine = Semiclip::OnTraceLine;
+  t->pfnTraceHull = Semiclip::OnTraceHull;
+  return TRUE;
+}
+
+C_DLLEXPORT int GetEngineFunctions_Post(enginefuncs_t *t, int *ver) {
+  if (!t || !ver) return FALSE;
+  if (*ver != ENGINE_INTERFACE_VERSION) {
+    *ver = ENGINE_INTERFACE_VERSION;
+    return FALSE;
+  }
+  t->pfnTraceLine = Semiclip::OnTraceLine_Post;
+  t->pfnTraceHull = Semiclip::OnTraceHull_Post;
+  return TRUE;
+}
+
+C_DLLEXPORT int GetNewDLLFunctions(NEW_DLL_FUNCTIONS *t, int *ver) {
+  if (!t || !ver) {
+    return FALSE;
+  }
+  if (*ver != NEW_DLL_FUNCTIONS_VERSION) {
+    *ver = NEW_DLL_FUNCTIONS_VERSION;
+    return FALSE;
+  }
+  std::memset(&gNewDLLFunctionTable, 0, sizeof(gNewDLLFunctionTable));
+  gNewDLLFunctionTable.pfnShouldCollide = Semiclip::OnShouldCollide;
+  std::memcpy(t, &gNewDLLFunctionTable, sizeof(NEW_DLL_FUNCTIONS));
   return TRUE;
 }
 
 #ifdef WIN32
 extern "C" C_DLLEXPORT void WINAPI GiveFnptrsToDll(enginefuncs_t *pengfuncsFromEngine,
-                                       globalvars_t *pGlobals) {
+                                                   globalvars_t *pGlobals) {
 #else
 extern "C" C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncsFromEngine,
-                                globalvars_t *pGlobals) {
+                                            globalvars_t *pGlobals) {
 #endif
   if (pengfuncsFromEngine) {
     std::memcpy(&g_engfuncs, pengfuncsFromEngine, sizeof(enginefuncs_t));
@@ -108,19 +135,14 @@ extern "C" C_DLLEXPORT void GiveFnptrsToDll(enginefuncs_t *pengfuncsFromEngine,
 }
 
 static META_FUNCTIONS gMetaFunctionTable = {
-    NULL,               // pfnGetEntityAPI
-    NULL,               // pfnGetEntityAPI_Post
-    GetEntityAPI2,      // pfnGetEntityAPI2
-    GetEntityAPI2_Post, // pfnGetEntityAPI2_Post
-    NULL,               // pfnGetNewDLLFunctions
-    NULL,               // pfnGetNewDLLFunctions_Post
-    // 2.4: deliberately NO GetEngineFunctions / _Post. This plugin hooks no
-    // engine functions, and copying sizeof(enginefuncs_t) into metamod's
-    // buffer is an ABI trap: enginefuncs_t grew in metamod-p p105
-    // (pfnPEntityOfEntIndexAllEntities), so a plugin built with new headers
-    // overflows the table of an older metamod binary and crashes on load.
-    NULL,               // pfnGetEngineFunctions
-    NULL,               // pfnGetEngineFunctions_Post
+    NULL,                    // pfnGetEntityAPI
+    NULL,                    // pfnGetEntityAPI_Post
+    GetEntityAPI2,           // pfnGetEntityAPI2
+    GetEntityAPI2_Post,      // pfnGetEntityAPI2_Post
+    GetNewDLLFunctions,      // pfnGetNewDLLFunctions
+    NULL,                    // pfnGetNewDLLFunctions_Post
+    GetEngineFunctions,      // pfnGetEngineFunctions
+    GetEngineFunctions_Post, // pfnGetEngineFunctions_Post
 };
 
 C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo,
@@ -134,7 +156,7 @@ C_DLLEXPORT int Meta_Query(char *interfaceVersion, plugin_info_t **plinfo,
   return TRUE;
 }
 
-C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
+C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME /*now*/, META_FUNCTIONS *pFunctionTable,
                             meta_globals_t *pMGlobals,
                             gamedll_funcs_t *pGamedllFuncs) {
   if (!pFunctionTable || !pMGlobals) {
@@ -143,18 +165,15 @@ C_DLLEXPORT int Meta_Attach(PLUG_LOADTIME now, META_FUNCTIONS *pFunctionTable,
 
   gpMetaGlobals = pMGlobals;
   gpGamedllFuncs = pGamedllFuncs;
-  
-  std::memcpy(pFunctionTable, &gMetaFunctionTable, sizeof(META_FUNCTIONS));
 
+  std::memcpy(pFunctionTable, &gMetaFunctionTable, sizeof(META_FUNCTIONS));
   PluginInit();
 
   return TRUE;
 }
 
-C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME now, PL_UNLOAD_REASON reason) {
-  // 2.4: if we unload between a pre/post pair, put pev->solid back first.
-  Semiclip::RestoreTrackedSolidStates();
-  Semiclip::RestoreThinkWindowStates();
+C_DLLEXPORT int Meta_Detach(PLUG_LOADTIME /*now*/, PL_UNLOAD_REASON /*reason*/) {
+  Semiclip::RestoreAllSolidStates();
   Semiclip::ResetCapTracking();
   gpGamedllFuncs = nullptr;
   gpMetaGlobals = nullptr;
